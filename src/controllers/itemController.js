@@ -1,81 +1,124 @@
 const Item = require("../models/Item");
-
 exports.createItem = async (req, res) => {
   try {
-    const { title, description,expectedItem, category, condition} = req.body;
+    const { title, description, category, condition, lookingFor, images } = req.body;
+    if (!title || !description || !category || !condition || !lookingFor) {
+      return res.status(400).json({ message: "All required fields must be provided" });
+    }
 
     const item = new Item({
       title,
       description,
       category,
       condition,
-      expectedItem,
+      lookingFor,
+      images: images || [],
       owner: req.user.id,
     });
 
     await item.save();
 
-    return res.status(200).json({ message: "Item Created Successfully" });
+    return res.status(201).json({
+      message: "Item created successfully",
+      item,
+    });
   } catch (error) {
-    return res
-      .status(500)
-      .json({ message: error.message || "Item not Created" });
+    return res.status(500).json({ message: error.message });
   }
 };
-
 exports.getItems = async (req, res) => {
   try {
-    const page = Number(req.query.page) || 1;
+    const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = 10;
+    const skip = (page - 1) * limit;
 
-    if (page < 1) {
-      return res.status(400).json({ message: "Invalid page number" });
+    const filter = { status: "available" };
+
+    if (req.query.category) {
+      filter.category = req.query.category;
     }
-    const query = { status: "available" };
-    if (req.user && req.user.id) {
-      query.owner = { $ne: req.user.id };
+
+    if (req.query.condition) {
+      filter.condition = req.query.condition;
     }
 
-    const totalItems = await Item.countDocuments(query);
-    const items = await Item.find(query )
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .populate("owner", "name email");
+    if (req.query.search) {
+      filter.title = { $regex: req.query.search, $options: "i" };
+    }
 
-    res.json({ page,
+    const items = await Item.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit + 1)
+      .populate("owner", "name");
+
+    const hasMore = items.length > limit;
+    if (hasMore) items.pop();
+
+    return res.json({
+      page,
       limit,
-      totalItems,
-      totalPages : Math.ceil(totalItems / limit),
-      items});
+      hasMore,
+      items,
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 };
-exports.getMyItem = async (req, res) => {
+exports.getItemDetails = async (req, res) => {
   try {
-    const items = await Item.find({ owner: req.user.id });
-    if (items.length === 0) {
-      return res.status(404).json({ message: "No items posted by you" });
-    }
-    res.json(items);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
+    const { id } = req.params;
 
-exports.deleteItem = async (req, res) => {
-  try {
-    const item = await Item.findById(req.params.id);
+    const item = await Item.findById(id).populate(
+      "owner",
+      "name rating isVerified profileImage createdAt"
+    );
 
-    if (!item) {
+    if (!item || item.status !== "available") {
       return res.status(404).json({ message: "Item not found" });
     }
-    if (item.owner.toString() !== req.user.id) {
-      return res.status(403).json({ message: "Not authorized" });
+
+    const relatedItems = await Item.find({
+      category: item.category,
+      status: "available",
+      _id: { $ne: item._id },
+    })
+      .sort({ createdAt: -1 })
+      .limit(4)
+      .populate("owner", "name");
+
+    return res.json({
+      item,
+      relatedItems,
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+exports.getMyItems = async (req, res) => {
+  try {
+    const items = await Item.find({ owner: req.user.id })
+      .sort({ createdAt: -1 });
+
+    return res.json(items);
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+exports.deleteItem = async (req, res) => {
+  try {
+    const item = await Item.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+    });
+
+    if (!item) {
+      return res.status(404).json({ message: "Item not found or not authorized" });
     }
 
     await item.deleteOne();
-    return res.json({ message: "Item deleted Succesfully" });
+
+    return res.json({ message: "Item deleted successfully" });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }

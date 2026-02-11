@@ -20,6 +20,13 @@ const userSchema = new mongoose.Schema({
   resetPasswordExpires: {
     type: Date,
   },
-});
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+  profileImage: {
+    type: String,
+  },
+}, { timestamps: true });
 
 module.exports = mongoose.model("User", userSchema);

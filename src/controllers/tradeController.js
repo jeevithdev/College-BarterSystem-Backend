@@ -5,28 +5,23 @@ exports.createTradeRequest = async (req, res) => {
   try {
     const { offeredItem, requestedItem } = req.body;
 
-    if (offeredItem === requestedItem) {
-      return res
-        .status(400)
-        .json({ message: "Offered and requested items cannot be the same" });
+    if (!offeredItem || !requestedItem || offeredItem === requestedItem) {
+      return res.status(400).json({ message: "Invalid trade request" });
     }
 
     const [reqItem, offItem] = await Promise.all([
-      Item.findById(requestedItem),
-      Item.findById(offeredItem),
+      Item.findOne({ _id: requestedItem, status: "available" }),
+      Item.findOne({ _id: offeredItem, owner: req.user.id, status: "available" }),
     ]);
 
     if (!reqItem || !offItem) {
-      return res.status(404).json({ message: "Item not found" });
+      return res.status(404).json({ message: "Item not available for trade" });
     }
-    if (reqItem.owner.toString() == req.user.id) {
+
+    if (reqItem.owner.toString() === req.user.id) {
       return res.status(400).json({ message: "Cannot request your own item" });
     }
-    if (offItem.owner.toString() != req.user.id) {
-      return res
-        .status(403)
-        .json({ message: "You can only offer your own items" });
-    }
+
     const existingTrade = await Trade.findOne({
       offeredItem,
       requestedItem,
@@ -37,19 +32,15 @@ exports.createTradeRequest = async (req, res) => {
     if (existingTrade) {
       return res.status(400).json({ message: "Trade request already exists" });
     }
-    let trade = new Trade({
+
+    const trade = await Trade.create({
       offeredItem,
       requestedItem,
       requester: req.user.id,
       owner: reqItem.owner,
     });
 
-    await trade.save();
-
-    res.json({
-      message: "Trade request sent",
-      trade,
-    });
+    res.status(201).json({ message: "Trade request sent", trade });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -60,7 +51,7 @@ exports.myRequests = async (req, res) => {
     const trades = await Trade.find({ requester: req.user.id })
       .populate("offeredItem", "title status")
       .populate("requestedItem", "title status")
-      .populate("owner", "email name");
+      .populate("owner", "name");
 
     res.json(trades);
   } catch (error) {
@@ -72,7 +63,7 @@ exports.requestForMe = async (req, res) => {
     const trades = await Trade.find({ owner: req.user.id })
       .populate("offeredItem", "title status")
       .populate("requestedItem", "title status")
-      .populate("requester", "email name");
+      .populate("requester", "name");
     res.json(trades);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -187,6 +178,10 @@ exports.completeTrade = async (req, res) => {
     if (offeredItem.status !== "traded" || requestedItem.status !== "traded") {
       return res.status(409).json({ message: "Items not locked for trade" });
     }
+    if (trade.owner.toString() === trade.requester.toString()) {
+  return res.status(400).json({ message: "Invalid trade data" });
+}
+
 
     const tempOwner = offeredItem.owner;
     offeredItem.owner = requestedItem.owner;
