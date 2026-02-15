@@ -23,8 +23,11 @@ const tradeSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["pending", "accepted", "rejected"," cancelled","completed"],
-    default: "pending",
+    enum: ["proposed", "negotiating", "confirmed", "completed", "rejected"],
+    default: "proposed",
+  },
+  completedAt: {
+    type: Date,
   },
   createdAt: {
     type: Date,
