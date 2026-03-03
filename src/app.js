@@ -6,7 +6,6 @@ const path = require("path");
 const authRoutes = require("./routes/auth");
 const itemRoutes = require("./routes/itemRoutes");
 const tradeRoutes = require("./routes/tradeRoutes");
-const conversationRoutes = require("./routes/conversationRoutes");
 require("dotenv").config();
 
 app.use(express.json());
@@ -20,8 +19,6 @@ app.use(cors(corsOptions));
 app.use("/api/auth", authRoutes);
 app.use("/api/items", itemRoutes);
 app.use("/api/trades", tradeRoutes);
-app.use("/api/conversations", conversationRoutes);
-
 
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("Connected to MongoDB Atlas"))

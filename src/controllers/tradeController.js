@@ -1,7 +1,6 @@
 const mongoose = require("mongoose");
 const Item = require("../models/Item");
 const Trade = require("../models/Trade");
-const Conversation = require("../models/Conversation");
 
 exports.createTradeRequest = async (req, res) => {
   const session = await mongoose.startSession();
@@ -78,26 +77,17 @@ exports.createTradeRequest = async (req, res) => {
       { session }
     );
 
-    const conversation = await Conversation.create(
-      [
-        {
-          participants: [req.user.id, reqItem.owner],
-          trade: trade[0]._id,
-        },
-      ],
-      { session }
-    );
-
     await session.commitTransaction();
     session.endSession();
 
     res.status(201).json({
       message: "Trade request created",
       trade: trade[0],
-      conversationId: conversation[0]._id,
     });
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
     session.endSession();
     res.status(500).json({ message: error.message });
   }
@@ -191,7 +181,9 @@ exports.confirmTrade = async (req, res) => {
 
     res.json({ message: "Trade confirmed successfully", trade });
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
     session.endSession();
     res.status(500).json({ message: error.message });
   }
@@ -255,7 +247,9 @@ exports.completeTrade = async (req, res) => {
 
     res.json({ message: "Trade completed successfully", trade });
   } catch (error) {
-    await session.abortTransaction();
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
     session.endSession();
     res.status(500).json({ message: error.message });
   }

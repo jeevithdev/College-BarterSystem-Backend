@@ -6,6 +6,17 @@ exports.createItem = async (req, res) => {
       return res.status(400).json({ message: "All required fields must be provided" });
     }
 
+    // Check for duplicate item (same title and owner)
+    const existingItem = await Item.findOne({
+      title: { $regex: `^${title.trim()}$`, $options: "i" },
+      owner: req.user.id,
+      status: "available",
+    });
+
+    if (existingItem) {
+      return res.status(409).json({ message: "You already have an available item with this title" });
+    }
+
     const item = new Item({
       title,
       description,
@@ -105,6 +116,54 @@ exports.getMyItems = async (req, res) => {
     return res.status(500).json({ message: error.message });
   }
 };
+
+exports.editItem = async (req, res) => {
+  try {
+    const { title, description, category, condition, lookingFor, images } = req.body;
+
+    const item = await Item.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+      status: "available",
+    });
+
+    if (!item) {
+      return res.status(404).json({ message: "Item not found, not authorized, or already traded" });
+    }
+
+    // Check for duplicate title if title is being updated
+    if (title && title.trim() !== item.title) {
+      const duplicateItem = await Item.findOne({
+        title: { $regex: `^${title.trim()}$`, $options: "i" },
+        owner: req.user.id,
+        status: "available",
+        _id: { $ne: req.params.id },
+      });
+
+      if (duplicateItem) {
+        return res.status(409).json({ message: "You already have another available item with this title" });
+      }
+    }
+
+    // Update only the fields that are provided
+    if (title !== undefined) item.title = title;
+    if (description !== undefined) item.description = description;
+    if (category !== undefined) item.category = category;
+    if (condition !== undefined) item.condition = condition;
+    if (lookingFor !== undefined) item.lookingFor = lookingFor;
+    if (images !== undefined) item.images = images;
+
+    await item.save();
+
+    return res.json({
+      message: "Item updated successfully",
+      item,
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
 exports.deleteItem = async (req, res) => {
   try {
     const item = await Item.findOne({
