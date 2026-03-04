@@ -23,8 +23,29 @@ const tradeSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["proposed", "negotiating", "confirmed", "completed", "rejected"],
+    enum: ["proposed", "accepted", "confirmed", "completed", "rejected", "expired"],
     default: "proposed",
+  },
+  // Track confirmation from both parties
+  requesterConfirmed: {
+    type: Boolean,
+    default: false,
+  },
+  ownerConfirmed: {
+    type: Boolean,
+    default: false,
+  },
+  // Track completion from both parties
+  requesterCompleted: {
+    type: Boolean,
+    default: false,
+  },
+  ownerCompleted: {
+    type: Boolean,
+    default: false,
+  },
+  confirmedAt: {
+    type: Date,
   },
   completedAt: {
     type: Date,

@@ -182,3 +182,32 @@ exports.deleteItem = async (req, res) => {
     return res.status(500).json({ message: error.message });
   }
 };
+
+// Re-list a traded item back to available status
+// This allows new owners to make their traded items available for trade again
+exports.relistItem = async (req, res) => {
+  try {
+    const item = await Item.findOne({
+      _id: req.params.id,
+      owner: req.user.id,
+      status: "traded", // Can only relist items that are traded
+    });
+
+    if (!item) {
+      return res.status(404).json({ 
+        message: "Item not found, not authorized, or not in traded status" 
+      });
+    }
+
+    // Change status back to available
+    item.status = "available";
+    await item.save();
+
+    return res.json({
+      message: "Item re-listed successfully and is now available for trading",
+      item,
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};

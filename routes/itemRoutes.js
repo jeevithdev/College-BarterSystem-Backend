@@ -9,5 +9,6 @@ router.get('/mine',auth,itemController.getMyItems);
 router.get('/:id',itemController.getItemDetails);
 router.put('/:id',auth,itemController.editItem);
 router.delete('/:id',auth,itemController.deleteItem);
+router.post('/:id/relist',auth,itemController.relistItem);
 
 module.exports = router;
