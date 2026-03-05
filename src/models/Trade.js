@@ -23,7 +23,7 @@ const tradeSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["proposed", "accepted", "confirmed", "completed", "rejected", "expired"],
+    enum: ["proposed", "accepted", "confirmed", "completed", "rejected", "withdrawn", "expired"],
     default: "proposed",
   },
   // Track confirmation from both parties
