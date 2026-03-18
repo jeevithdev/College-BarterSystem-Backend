@@ -6,6 +6,21 @@ const { notifyNewMessage } = require("../utils/pushNotificationService");
 const MAX_MESSAGE_LENGTH = 2000;
 const MESSAGES_PER_PAGE = 50;
 
+const rateLimitCache = new Map();
+const CACHE_CLEANUP_INTERVAL = 5 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, timestamps] of rateLimitCache.entries()) {
+    const recent = timestamps.filter(ts => now - ts < 60000);
+    if (recent.length === 0) {
+      rateLimitCache.delete(userId);
+    } else {
+      rateLimitCache.set(userId, recent);
+    }
+  }
+}, CACHE_CLEANUP_INTERVAL);
+
 const sanitizeText = (text) => {
   if (typeof text !== "string") return "";
   return text
@@ -16,12 +31,8 @@ const sanitizeText = (text) => {
 
 const checkRateLimit = (userId, limit = 10, windowMs = 60000) => {
   const now = Date.now();
-  if (!checkRateLimit.cache) {
-    checkRateLimit.cache = new Map();
-  }
-  
   const userKey = userId.toString();
-  const userHistory = checkRateLimit.cache.get(userKey) || [];
+  const userHistory = rateLimitCache.get(userKey) || [];
   
   const recentRequests = userHistory.filter(timestamp => now - timestamp < windowMs);
   
@@ -30,16 +41,7 @@ const checkRateLimit = (userId, limit = 10, windowMs = 60000) => {
   }
   
   recentRequests.push(now);
-  checkRateLimit.cache.set(userKey, recentRequests);
-  
-  setTimeout(() => {
-    const updated = (checkRateLimit.cache.get(userKey) || []).filter(t => now - t < windowMs);
-    if (updated.length === 0) {
-      checkRateLimit.cache.delete(userKey);
-    } else {
-      checkRateLimit.cache.set(userKey, updated);
-    }
-  }, windowMs);
+  rateLimitCache.set(userKey, recentRequests);
   
   return true;
 };
