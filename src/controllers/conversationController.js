@@ -1,51 +1,38 @@
 const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
+const User = require("../models/User");
 const mongoose = require("mongoose");
+const { validationResult } = require("express-validator");
 const { notifyNewMessage } = require("../utils/pushNotificationService");
+const { sanitizeText, validateAttachments, MAX_MESSAGE_LENGTH } = require("../utils/helpers");
 
-const MAX_MESSAGE_LENGTH = 2000;
 const MESSAGES_PER_PAGE = 50;
 
-const rateLimitCache = new Map();
-const CACHE_CLEANUP_INTERVAL = 5 * 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [userId, timestamps] of rateLimitCache.entries()) {
-    const recent = timestamps.filter(ts => now - ts < 60000);
-    if (recent.length === 0) {
-      rateLimitCache.delete(userId);
-    } else {
-      rateLimitCache.set(userId, recent);
-    }
-  }
-}, CACHE_CLEANUP_INTERVAL);
-
-const sanitizeText = (text) => {
-  if (typeof text !== "string") return "";
-  return text
-    .trim()
-    .slice(0, MAX_MESSAGE_LENGTH)
-    .replace(/[<>]/g, "");
-};
-
-const checkRateLimit = (userId, limit = 10, windowMs = 60000) => {
-  const now = Date.now();
-  const userKey = userId.toString();
-  const userHistory = rateLimitCache.get(userKey) || [];
-  
-  const recentRequests = userHistory.filter(timestamp => now - timestamp < windowMs);
-  
-  if (recentRequests.length >= limit) {
+// ─── Helper: validation ───────────────────────────────────────────────
+const checkValidation = (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    res.status(400).json({ message: "Validation failed", errors: errors.array() });
     return false;
   }
-  
-  recentRequests.push(now);
-  rateLimitCache.set(userKey, recentRequests);
-  
   return true;
 };
 
+// ─── Helper: increment unread count for all recipients ────────────────
+const incrementUnreadForRecipients = (conversation, senderId) => {
+  if (!conversation.unreadCount) {
+    conversation.unreadCount = new Map();
+  }
+  for (const participantId of conversation.participants) {
+    const pid = participantId.toString();
+    if (pid !== senderId.toString()) {
+      const current = conversation.unreadCount.get(pid) || 0;
+      conversation.unreadCount.set(pid, current + 1);
+    }
+  }
+};
+
+// ─── Get Conversations (paginated) ────────────────────────────────────
 exports.getConversations = async (req, res) => {
   try {
     const page = Math.max(Number(req.query.page) || 1, 1);
@@ -55,14 +42,14 @@ exports.getConversations = async (req, res) => {
     const conversations = await Conversation.find({
       participants: req.user.id,
     })
-      .populate("participants", "name email profileImage")
+      .populate("participants", "name email profileImage isOnline lastSeen")
       .populate("lastMessage", "text createdAt sender")
       .populate("trade", "status")
       .sort({ lastMessageAt: -1 })
       .skip(skip)
       .limit(limit);
 
-    const conversationsWithUnread = conversations.map(conv => {
+    const conversationsWithUnread = conversations.map((conv) => {
       const unread = conv.unreadCount?.get(req.user.id) || 0;
       return {
         ...conv.toObject(),
@@ -85,10 +72,11 @@ exports.getConversations = async (req, res) => {
   }
 };
 
+// ─── Get Single Conversation ──────────────────────────────────────────
 exports.getConversation = async (req, res) => {
   try {
     const conversation = await Conversation.findById(req.params.id)
-      .populate("participants", "name email profileImage")
+      .populate("participants", "name email profileImage isOnline lastSeen")
       .populate("trade");
 
     if (!conversation) {
@@ -113,6 +101,7 @@ exports.getConversation = async (req, res) => {
   }
 };
 
+// ─── Get Messages (paginated) ─────────────────────────────────────────
 exports.getMessages = async (req, res) => {
   try {
     const { id } = req.params;
@@ -121,17 +110,16 @@ exports.getMessages = async (req, res) => {
     const skip = (page - 1) * limit;
 
     const conversation = await Conversation.findById(id);
-
     if (!conversation) {
       return res.status(404).json({ message: "Conversation not found" });
     }
-
     if (!conversation.isParticipant(req.user.id)) {
       return res.status(403).json({ message: "Access denied" });
     }
 
     const messages = await Message.find({ conversation: id })
       .populate("sender", "name email profileImage")
+      .populate("replyTo", "text sender")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -152,38 +140,30 @@ exports.getMessages = async (req, res) => {
   }
 };
 
+// ─── Send Message ─────────────────────────────────────────────────────
 exports.sendMessage = async (req, res) => {
   let session;
-  
+
   try {
+    if (!checkValidation(req, res)) return;
+
     const { id } = req.params;
-    const { text, tempId } = req.body;
+    const { text } = req.body;
 
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ message: "Message text is required" });
-    }
-
-    const sanitizedText = sanitizeText(text);
-    
-    if (!sanitizedText) {
+    const sanitized = sanitizeText(text);
+    if (!sanitized) {
       return res.status(400).json({ message: "Message cannot be empty" });
-    }
-
-    if (!checkRateLimit(req.user.id)) {
-      return res.status(429).json({ message: "Too many messages. Please wait." });
     }
 
     session = await mongoose.startSession();
     session.startTransaction();
 
     const conversation = await Conversation.findById(id).session(session);
-
     if (!conversation) {
       await session.abortTransaction();
       await session.endSession();
       return res.status(404).json({ message: "Conversation not found" });
     }
-
     if (!conversation.isParticipant(req.user.id)) {
       await session.abortTransaction();
       await session.endSession();
@@ -193,54 +173,52 @@ exports.sendMessage = async (req, res) => {
     const message = new Message({
       conversation: id,
       sender: req.user.id,
-      text: sanitizedText,
+      text: sanitized,
       readBy: [req.user.id],
     });
     await message.save({ session });
 
     conversation.lastMessage = message._id;
     conversation.lastMessageAt = new Date();
-    
-    const currentUnread = conversation.unreadCount?.get(req.user.id) || 0;
-    conversation.unreadCount?.set(req.user.id, currentUnread);
-    
+
+    // FIX: increment unread count for all OTHER participants, not sender
+    incrementUnreadForRecipients(conversation, req.user.id);
+
     await conversation.save({ session });
 
     await session.commitTransaction();
     await session.endSession();
 
-    const populatedMessage = await Message.findById(message._id)
-      .populate("sender", "name email profileImage");
+    const populatedMessage = await Message.findById(message._id).populate(
+      "sender",
+      "name email profileImage"
+    );
 
+    // Real-time events
     if (req.io) {
-      conversation.participants.forEach(participantId => {
+      conversation.participants.forEach((participantId) => {
         if (participantId.toString() !== req.user.id) {
           req.io.to(`user:${participantId}`).emit("newMessage", {
             conversationId: id,
             message: populatedMessage,
           });
-          
-          const unreadKey = participantId.toString();
-          const currentCount = conversation.unreadCount?.get(unreadKey) || 0;
+
+          const unreadCount = conversation.unreadCount?.get(participantId.toString()) || 0;
           req.io.to(`user:${participantId}`).emit("unreadUpdate", {
             conversationId: id,
-            unreadCount: currentCount + 1,
+            unreadCount,
           });
         }
       });
-      
+
       notifyNewMessage(id, message._id, req.user.id).catch(console.error);
     }
 
-    res.status(201).json({
-      message: populatedMessage,
-    });
+    res.status(201).json({ message: populatedMessage });
   } catch (error) {
     if (session) {
       try {
-        if (session.inTransaction()) {
-          await session.abortTransaction();
-        }
+        if (session.inTransaction()) await session.abortTransaction();
         await session.endSession();
       } catch (cleanupError) {
         console.error("Session cleanup error:", cleanupError.message);
@@ -251,16 +229,113 @@ exports.sendMessage = async (req, res) => {
   }
 };
 
+// ─── Send Message With Attachments ────────────────────────────────────
+exports.sendMessageWithAttachments = async (req, res) => {
+  let session;
+
+  try {
+    const { id } = req.params;
+    const { text, attachments, replyTo } = req.body;
+
+    const sanitized = text ? sanitizeText(text) : "";
+    const validAttachments = validateAttachments(attachments);
+
+    if (!sanitized && validAttachments.length === 0) {
+      return res.status(400).json({ message: "Message must have text or attachments" });
+    }
+
+    session = await mongoose.startSession();
+    session.startTransaction();
+
+    const conversation = await Conversation.findById(id).session(session);
+    if (!conversation) {
+      await session.abortTransaction();
+      await session.endSession();
+      return res.status(404).json({ message: "Conversation not found" });
+    }
+    if (!conversation.isParticipant(req.user.id)) {
+      await session.abortTransaction();
+      await session.endSession();
+      return res.status(403).json({ message: "Access denied" });
+    }
+
+    const messageData = {
+      conversation: id,
+      sender: req.user.id,
+      text: sanitized,
+      readBy: [req.user.id],
+    };
+
+    if (validAttachments.length > 0) messageData.attachments = validAttachments;
+
+    if (replyTo) {
+      const parentMessage = await Message.findById(replyTo).session(session);
+      if (parentMessage && parentMessage.conversation.toString() === id) {
+        messageData.replyTo = replyTo;
+      }
+    }
+
+    const message = new Message(messageData);
+    await message.save({ session });
+
+    conversation.lastMessage = message._id;
+    conversation.lastMessageAt = new Date();
+
+    // FIX: increment unread count for recipients
+    incrementUnreadForRecipients(conversation, req.user.id);
+
+    await conversation.save({ session });
+
+    await session.commitTransaction();
+    await session.endSession();
+
+    const populatedMessage = await Message.findById(message._id)
+      .populate("sender", "name email profileImage")
+      .populate("replyTo", "text sender");
+
+    if (req.io) {
+      conversation.participants.forEach((participantId) => {
+        if (participantId.toString() !== req.user.id) {
+          req.io.to(`user:${participantId}`).emit("newMessage", {
+            conversationId: id,
+            message: populatedMessage,
+          });
+
+          const unreadCount = conversation.unreadCount?.get(participantId.toString()) || 0;
+          req.io.to(`user:${participantId}`).emit("unreadUpdate", {
+            conversationId: id,
+            unreadCount,
+          });
+        }
+      });
+
+      notifyNewMessage(id, message._id, req.user.id).catch(console.error);
+    }
+
+    res.status(201).json({ message: populatedMessage });
+  } catch (error) {
+    if (session) {
+      try {
+        if (session.inTransaction()) await session.abortTransaction();
+        await session.endSession();
+      } catch (cleanupError) {
+        console.error("Session cleanup error:", cleanupError.message);
+      }
+    }
+    console.error("Error sending message with attachments:", error.message);
+    res.status(500).json({ message: "Failed to send message" });
+  }
+};
+
+// ─── Mark Messages as Read ────────────────────────────────────────────
 exports.markAsRead = async (req, res) => {
   try {
     const { id } = req.params;
 
     const conversation = await Conversation.findById(id);
-
     if (!conversation) {
       return res.status(404).json({ message: "Conversation not found" });
     }
-
     if (!conversation.isParticipant(req.user.id)) {
       return res.status(403).json({ message: "Access denied" });
     }
@@ -274,6 +349,7 @@ exports.markAsRead = async (req, res) => {
       { $addToSet: { readBy: req.user.id } }
     );
 
+    // Reset unread count to 0 for this user
     if (conversation.unreadCount) {
       conversation.unreadCount.set(req.user.id, 0);
       await conversation.save();
@@ -289,15 +365,14 @@ exports.markAsRead = async (req, res) => {
   }
 };
 
+// ─── Create Conversation ──────────────────────────────────────────────
 exports.createConversation = async (req, res) => {
   let session;
-  
-  try {
-    const { participantId, tradeId } = req.body;
 
-    if (!participantId) {
-      return res.status(400).json({ message: "Participant ID is required" });
-    }
+  try {
+    if (!checkValidation(req, res)) return;
+
+    const { participantId, tradeId } = req.body;
 
     if (participantId === req.user.id) {
       return res.status(400).json({ message: "Cannot create conversation with yourself" });
@@ -306,18 +381,19 @@ exports.createConversation = async (req, res) => {
     session = await mongoose.startSession();
     session.startTransaction();
 
-    const existingConversation = await Conversation.findByParticipants(
-      [req.user.id, participantId]
-    ).session(session);
+    const existingConversation = await Conversation.findByParticipants([
+      req.user.id,
+      participantId,
+    ]).session(session);
 
     if (existingConversation) {
       await session.abortTransaction();
       await session.endSession();
-      
+
       const populated = await Conversation.findById(existingConversation._id)
         .populate("participants", "name email profileImage")
         .populate("trade");
-      
+
       return res.json({
         message: "Conversation already exists",
         conversation: populated,
@@ -338,16 +414,11 @@ exports.createConversation = async (req, res) => {
       .populate("participants", "name email profileImage")
       .populate("trade");
 
-    res.status(201).json({
-      message: "Conversation created",
-      conversation: populated,
-    });
+    res.status(201).json({ message: "Conversation created", conversation: populated });
   } catch (error) {
     if (session) {
       try {
-        if (session.inTransaction()) {
-          await session.abortTransaction();
-        }
+        if (session.inTransaction()) await session.abortTransaction();
         await session.endSession();
       } catch (cleanupError) {
         console.error("Session cleanup error:", cleanupError.message);
@@ -358,12 +429,14 @@ exports.createConversation = async (req, res) => {
   }
 };
 
+// ─── Get or Create Trade Conversation ─────────────────────────────────
+// FIX: Uses query param instead of req.body (was GET route reading body)
 exports.getOrCreateTradeConversation = async (req, res) => {
   try {
-    const { tradeId } = req.body;
+    const tradeId = req.query.tradeId;
 
     if (!tradeId) {
-      return res.status(400).json({ message: "Trade ID is required" });
+      return res.status(400).json({ message: "tradeId query parameter is required" });
     }
 
     const conversation = await Conversation.findOne({ trade: tradeId })
@@ -379,13 +452,11 @@ exports.getOrCreateTradeConversation = async (req, res) => {
 
     const Trade = require("../models/Trade");
     const trade = await Trade.findById(tradeId);
-
     if (!trade) {
       return res.status(404).json({ message: "Trade not found" });
     }
 
     const participants = [trade.requester.toString(), trade.owner.toString()];
-    
     if (!participants.includes(req.user.id)) {
       return res.status(403).json({ message: "Access denied" });
     }
@@ -401,16 +472,14 @@ exports.getOrCreateTradeConversation = async (req, res) => {
       .populate("participants", "name email profileImage")
       .populate("trade");
 
-    res.status(201).json({
-      message: "Conversation created for trade",
-      conversation: populated,
-    });
+    res.status(201).json({ message: "Conversation created for trade", conversation: populated });
   } catch (error) {
     console.error("Error creating trade conversation:", error.message);
     res.status(500).json({ message: "Failed to create conversation" });
   }
 };
 
+// ─── Add Reaction ─────────────────────────────────────────────────────
 const VALID_EMOJIS = ["👍", "👎", "❤️", "😂", "😮", "😢", "🎉", "🔥"];
 
 exports.addReaction = async (req, res) => {
@@ -419,14 +488,10 @@ exports.addReaction = async (req, res) => {
     const { emoji } = req.body;
 
     if (!emoji || !VALID_EMOJIS.includes(emoji)) {
-      return res.status(400).json({ 
-        message: "Invalid emoji",
-        validEmojis: VALID_EMOJIS 
-      });
+      return res.status(400).json({ message: "Invalid emoji", validEmojis: VALID_EMOJIS });
     }
 
     const message = await Message.findById(messageId);
-
     if (!message) {
       return res.status(404).json({ message: "Message not found" });
     }
@@ -437,12 +502,11 @@ exports.addReaction = async (req, res) => {
     }
 
     const existingReactionIndex = message.reactions.findIndex(
-      r => r.user.toString() === req.user.id
+      (r) => r.user.toString() === req.user.id
     );
 
     if (existingReactionIndex !== -1) {
       const existingEmoji = message.reactions[existingReactionIndex].emoji;
-      
       if (existingEmoji === emoji) {
         message.reactions.pull({ user: req.user.id });
       } else {
@@ -467,33 +531,33 @@ exports.addReaction = async (req, res) => {
       });
     }
 
-    res.json({
-      message: "Reaction updated",
-      reactions: updatedMessage.reactions,
-    });
+    res.json({ message: "Reaction updated", reactions: updatedMessage.reactions });
   } catch (error) {
     console.error("Error adding reaction:", error.message);
     res.status(500).json({ message: "Failed to add reaction" });
   }
 };
 
+// ─── Get Online Status ────────────────────────────────────────────────
+// FIX: Uses query param instead of req.body (was GET route reading body)
 exports.getOnlineUsers = async (req, res) => {
   try {
-    const { userIds } = req.body;
+    const userIdsParam = req.query.userIds;
 
-    if (!userIds || !Array.isArray(userIds)) {
-      return res.status(400).json({ message: "User IDs array is required" });
+    if (!userIdsParam) {
+      return res.status(400).json({ message: "userIds query parameter is required (comma-separated)" });
     }
 
-    const users = await require("../models/User").find({
+    const userIds = userIdsParam.split(",").map((id) => id.trim()).filter(Boolean);
+
+    const users = await User.find({
       _id: { $in: userIds },
-      isOnline: true,
     }).select("_id isOnline lastSeen");
 
     const onlineStatus = {};
-    users.forEach(user => {
+    users.forEach((user) => {
       onlineStatus[user._id.toString()] = {
-        isOnline: true,
+        isOnline: user.isOnline,
         lastSeen: user.lastSeen,
       };
     });
@@ -505,6 +569,7 @@ exports.getOnlineUsers = async (req, res) => {
   }
 };
 
+// ─── Update Push Token ────────────────────────────────────────────────
 exports.updatePushToken = async (req, res) => {
   try {
     const { pushToken } = req.body;
@@ -513,7 +578,6 @@ exports.updatePushToken = async (req, res) => {
       return res.status(400).json({ message: "Push token is required" });
     }
 
-    const User = require("../models/User");
     await User.findByIdAndUpdate(req.user.id, {
       pushNotificationToken: pushToken,
     });
@@ -525,6 +589,7 @@ exports.updatePushToken = async (req, res) => {
   }
 };
 
+// ─── Update Notification Preferences ──────────────────────────────────
 exports.updateNotificationPreferences = async (req, res) => {
   try {
     const { newMessage, tradeUpdate, tradeRequest } = req.body;
@@ -534,138 +599,11 @@ exports.updateNotificationPreferences = async (req, res) => {
     if (typeof tradeUpdate === "boolean") update["notificationPreferences.tradeUpdate"] = tradeUpdate;
     if (typeof tradeRequest === "boolean") update["notificationPreferences.tradeRequest"] = tradeRequest;
 
-    const User = require("../models/User");
     await User.findByIdAndUpdate(req.user.id, update);
 
     res.json({ message: "Notification preferences updated" });
   } catch (error) {
     console.error("Error updating notification preferences:", error.message);
     res.status(500).json({ message: "Failed to update preferences" });
-  }
-};
-
-exports.sendMessageWithAttachments = async (req, res) => {
-  let session;
-  
-  try {
-    const { id } = req.params;
-    const { text, tempId, attachments, replyTo } = req.body;
-
-    if ((!text || !text.trim()) && (!attachments || attachments.length === 0)) {
-      return res.status(400).json({ message: "Message must have text or attachments" });
-    }
-
-    if (!checkRateLimit(req.user.id)) {
-      return res.status(429).json({ message: "Too many messages. Please wait." });
-    }
-
-    const sanitizedText = text ? sanitizeText(text) : "";
-
-    const validAttachments = [];
-    if (attachments && attachments.length > 0) {
-      for (const att of attachments) {
-        if (att.type && att.url && att.name && att.size && att.mimeType) {
-          if (att.size <= 10 * 1024 * 1024) {
-            validAttachments.push({
-              type: att.type,
-              url: att.url,
-              name: att.name.slice(0, 255),
-              size: att.size,
-              mimeType: att.mimeType,
-            });
-          }
-        }
-      }
-    }
-
-    session = await mongoose.startSession();
-    session.startTransaction();
-
-    const conversation = await Conversation.findById(id).session(session);
-
-    if (!conversation) {
-      await session.abortTransaction();
-      await session.endSession();
-      return res.status(404).json({ message: "Conversation not found" });
-    }
-
-    if (!conversation.isParticipant(req.user.id)) {
-      await session.abortTransaction();
-      await session.endSession();
-      return res.status(403).json({ message: "Access denied" });
-    }
-
-    const messageData = {
-      conversation: id,
-      sender: req.user.id,
-      text: sanitizedText,
-      readBy: [req.user.id],
-    };
-
-    if (validAttachments.length > 0) {
-      messageData.attachments = validAttachments;
-    }
-
-    if (replyTo) {
-      const parentMessage = await Message.findById(replyTo).session(session);
-      if (parentMessage && parentMessage.conversation.toString() === id) {
-        messageData.replyTo = replyTo;
-      }
-    }
-
-    const message = new Message(messageData);
-    await message.save({ session });
-
-    conversation.lastMessage = message._id;
-    conversation.lastMessageAt = new Date();
-    
-    const currentUnread = conversation.unreadCount?.get(req.user.id) || 0;
-    conversation.unreadCount?.set(req.user.id, currentUnread);
-    
-    await conversation.save({ session });
-
-    await session.commitTransaction();
-    await session.endSession();
-
-    const populatedMessage = await Message.findById(message._id)
-      .populate("sender", "name email profileImage")
-      .populate("replyTo", "text sender");
-
-    if (req.io) {
-      conversation.participants.forEach(participantId => {
-        if (participantId.toString() !== req.user.id) {
-          req.io.to(`user:${participantId}`).emit("newMessage", {
-            conversationId: id,
-            message: populatedMessage,
-          });
-          
-          const unreadKey = participantId.toString();
-          const currentCount = conversation.unreadCount?.get(unreadKey) || 0;
-          req.io.to(`user:${participantId}`).emit("unreadUpdate", {
-            conversationId: id,
-            unreadCount: currentCount + 1,
-          });
-        }
-      });
-      
-      notifyNewMessage(id, message._id, req.user.id).catch(console.error);
-    }
-
-    res.status(201).json({
-      message: populatedMessage,
-    });
-  } catch (error) {
-    if (session) {
-      try {
-        if (session.inTransaction()) {
-          await session.abortTransaction();
-        }
-        await session.endSession();
-      } catch (cleanupError) {
-        console.error("Session cleanup error:", cleanupError.message);
-      }
-    }
-    console.error("Error sending message with attachments:", error.message);
-    res.status(500).json({ message: "Failed to send message" });
   }
 };

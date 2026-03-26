@@ -1,25 +1,35 @@
 {
   "name": "valrix-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "src/server.js",
   "scripts": {
-    "start": "",
+    "start": "node src/server.js",
     "dev": "nodemon src/server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Backend for Valrix - a barter and exchange platform",
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
-    "crypto": "^1.0.1",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
     "express-validator": "^7.0.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.10.1",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.20.0",
+    "multer": "^1.4.5-lts.1",
     "nodemailer": "^8.0.1",
-    "socket.io": "^4.7.2"
+    "prom-client": "^14.2.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.7.2",
+    "speakeasy": "^2.0.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
 }

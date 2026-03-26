@@ -2,13 +2,29 @@ const jwt = require("jsonwebtoken");
 const Conversation = require("../models/Conversation");
 const Message = require("../models/Message");
 const User = require("../models/User");
+const { sanitizeText, validateAttachments } = require("./helpers");
 
 const VALID_EMOJIS = ["👍", "👎", "❤️", "😂", "😮", "😢", "🎉", "🔥"];
 
+// ─── Helper: increment unread count for recipients ────────────────────
+const incrementUnreadForRecipients = (conversation, senderId) => {
+  if (!conversation.unreadCount) {
+    conversation.unreadCount = new Map();
+  }
+  for (const participantId of conversation.participants) {
+    const pid = participantId.toString();
+    if (pid !== senderId.toString()) {
+      const current = conversation.unreadCount.get(pid) || 0;
+      conversation.unreadCount.set(pid, current + 1);
+    }
+  }
+};
+
 const setupWebSocket = (io) => {
+  // ─── JWT Authentication Middleware ────────────────────────────────────
   io.use((socket, next) => {
     const token = socket.handshake.auth.token;
-    
+
     if (!token) {
       return next(new Error("Authentication required"));
     }
@@ -24,7 +40,8 @@ const setupWebSocket = (io) => {
 
   io.on("connection", async (socket) => {
     console.log(`User connected: ${socket.userId}`);
-    
+
+    // Update online status
     try {
       await User.findByIdAndUpdate(socket.userId, {
         isOnline: true,
@@ -33,17 +50,21 @@ const setupWebSocket = (io) => {
     } catch (error) {
       console.error("Error updating online status:", error.message);
     }
-    
+
+    // Join personal room for DMs and notifications
     socket.join(`user:${socket.userId}`);
 
+    // ─── Get Online Status ──────────────────────────────────────────────
     socket.on("getOnlineStatus", async (userIds) => {
       try {
+        if (!Array.isArray(userIds)) return;
+
         const users = await User.find({
           _id: { $in: userIds },
         }).select("_id isOnline lastSeen");
 
         const status = {};
-        users.forEach(user => {
+        users.forEach((user) => {
           status[user._id.toString()] = {
             isOnline: user.isOnline,
             lastSeen: user.lastSeen,
@@ -56,29 +77,30 @@ const setupWebSocket = (io) => {
       }
     });
 
+    // ─── Join Conversation Room ─────────────────────────────────────────
     socket.on("joinConversation", async (conversationId) => {
       try {
         const conversation = await Conversation.findById(conversationId);
-        
+
         if (!conversation || !conversation.isParticipant(socket.userId)) {
           socket.emit("error", { message: "Access denied" });
           return;
         }
 
         socket.join(`conversation:${conversationId}`);
-        console.log(`User ${socket.userId} joined conversation ${conversationId}`);
 
+        // Send online status of other participants
         const otherParticipants = conversation.participants
-          .filter(p => p.toString() !== socket.userId)
-          .map(p => p.toString());
-        
+          .filter((p) => p.toString() !== socket.userId)
+          .map((p) => p.toString());
+
         if (otherParticipants.length > 0) {
           const users = await User.find({
             _id: { $in: otherParticipants },
           }).select("_id isOnline lastSeen");
 
           const status = {};
-          users.forEach(user => {
+          users.forEach((user) => {
             status[user._id.toString()] = {
               isOnline: user.isOnline,
               lastSeen: user.lastSeen,
@@ -92,11 +114,12 @@ const setupWebSocket = (io) => {
       }
     });
 
+    // ─── Leave Conversation Room ────────────────────────────────────────
     socket.on("leaveConversation", (conversationId) => {
       socket.leave(`conversation:${conversationId}`);
-      console.log(`User ${socket.userId} left conversation ${conversationId}`);
     });
 
+    // ─── Typing Indicators ──────────────────────────────────────────────
     socket.on("typing", (conversationId) => {
       socket.to(`conversation:${conversationId}`).emit("userTyping", {
         conversationId,
@@ -111,55 +134,36 @@ const setupWebSocket = (io) => {
       });
     });
 
+    // ─── Send Message via WebSocket ─────────────────────────────────────
     socket.on("sendMessage", async (data) => {
       const { conversationId, text, tempId, attachments, replyTo } = data;
 
-      if ((!text || typeof text !== "string" || text.trim().length === 0) && (!attachments || attachments.length === 0)) {
-        socket.emit("error", { message: "Message cannot be empty" });
-        return;
-      }
+      // Use shared sanitizer
+      const sanitized = text ? sanitizeText(text) : "";
+      const validAttachmentList = validateAttachments(attachments);
 
-      if (text && text.length > 2000) {
-        socket.emit("error", { message: "Message too long" });
+      if (!sanitized && validAttachmentList.length === 0) {
+        socket.emit("error", { message: "Message cannot be empty" });
         return;
       }
 
       try {
         const conversation = await Conversation.findById(conversationId);
-        
+
         if (!conversation || !conversation.isParticipant(socket.userId)) {
           socket.emit("error", { message: "Access denied" });
           return;
         }
 
-        const sanitizedText = text ? text.trim().slice(0, 2000) : "";
-
-        const validAttachments = [];
-        if (attachments && attachments.length > 0) {
-          for (const att of attachments) {
-            if (att.type && att.url && att.name && att.size && att.mimeType) {
-              if (att.size <= 10 * 1024 * 1024) {
-                validAttachments.push({
-                  type: att.type,
-                  url: att.url,
-                  name: att.name.slice(0, 255),
-                  size: att.size,
-                  mimeType: att.mimeType,
-                });
-              }
-            }
-          }
-        }
-
         const messageData = {
           conversation: conversationId,
           sender: socket.userId,
-          text: sanitizedText,
+          text: sanitized,
           readBy: [socket.userId],
         };
 
-        if (validAttachments.length > 0) {
-          messageData.attachments = validAttachments;
+        if (validAttachmentList.length > 0) {
+          messageData.attachments = validAttachmentList;
         }
 
         if (replyTo) {
@@ -174,46 +178,43 @@ const setupWebSocket = (io) => {
 
         conversation.lastMessage = message._id;
         conversation.lastMessageAt = new Date();
-        
-        if (!conversation.unreadCount) {
-          conversation.unreadCount = new Map();
-        }
-        
-        const currentUnread = conversation.unreadCount.get(socket.userId.toString()) || 0;
-        conversation.unreadCount.set(socket.userId.toString(), currentUnread);
-        
+
+        // FIX: increment unread count for OTHER participants, not sender
+        incrementUnreadForRecipients(conversation, socket.userId);
+
         await conversation.save();
 
         const populatedMessage = await Message.findById(message._id)
           .populate("sender", "name email profileImage")
           .populate("replyTo", "text sender");
 
+        // Broadcast to conversation room
         io.to(`conversation:${conversationId}`).emit("newMessage", {
           conversationId,
           message: populatedMessage,
           tempId,
         });
 
-        conversation.participants.forEach(participantId => {
+        // Send unread updates to other participants
+        conversation.participants.forEach((participantId) => {
           if (participantId.toString() !== socket.userId) {
-            const unreadKey = participantId.toString();
-            const currentCount = conversation.unreadCount?.get(unreadKey) || 0;
+            const unreadCount = conversation.unreadCount?.get(participantId.toString()) || 0;
             io.to(`user:${participantId}`).emit("unreadUpdate", {
               conversationId,
-              unreadCount: currentCount + 1,
+              unreadCount,
             });
           }
         });
-
       } catch (error) {
         console.error("WebSocket sendMessage error:", error.message);
-        socket.emit("messageError", { 
-          tempId, 
-          message: "Failed to send message" 
+        socket.emit("messageError", {
+          tempId,
+          message: "Failed to send message",
         });
       }
     });
 
+    // ─── Add Reaction via WebSocket ─────────────────────────────────────
     socket.on("addReaction", async (data) => {
       const { messageId, emoji } = data;
 
@@ -224,7 +225,6 @@ const setupWebSocket = (io) => {
 
       try {
         const message = await Message.findById(messageId);
-
         if (!message) {
           socket.emit("error", { message: "Message not found" });
           return;
@@ -237,12 +237,11 @@ const setupWebSocket = (io) => {
         }
 
         const existingReactionIndex = message.reactions.findIndex(
-          r => r.user.toString() === socket.userId
+          (r) => r.user.toString() === socket.userId
         );
 
         if (existingReactionIndex !== -1) {
           const existingEmoji = message.reactions[existingReactionIndex].emoji;
-          
           if (existingEmoji === emoji) {
             message.reactions.pull({ user: socket.userId });
           } else {
@@ -255,25 +254,27 @@ const setupWebSocket = (io) => {
 
         await message.save();
 
-        const updatedMessage = await Message.findById(messageId)
-          .populate("reactions.user", "name email");
+        const updatedMessage = await Message.findById(messageId).populate(
+          "reactions.user",
+          "name email"
+        );
 
         io.to(`conversation:${conversation._id}`).emit("reactionUpdated", {
           conversationId: conversation._id,
           messageId,
           reactions: updatedMessage.reactions,
         });
-
       } catch (error) {
         console.error("WebSocket addReaction error:", error.message);
         socket.emit("error", { message: "Failed to add reaction" });
       }
     });
 
+    // ─── Mark Messages as Read via WebSocket ────────────────────────────
     socket.on("markRead", async (conversationId) => {
       try {
         const conversation = await Conversation.findById(conversationId);
-        
+
         if (!conversation || !conversation.isParticipant(socket.userId)) {
           return;
         }
@@ -296,21 +297,21 @@ const setupWebSocket = (io) => {
           conversationId,
           readBy: socket.userId,
         });
-
       } catch (error) {
         console.error("WebSocket markRead error:", error.message);
       }
     });
 
+    // ─── Disconnect ─────────────────────────────────────────────────────
     socket.on("disconnect", async () => {
       console.log(`User disconnected: ${socket.userId}`);
-      
+
       try {
         await User.findByIdAndUpdate(socket.userId, {
           isOnline: false,
           lastSeen: new Date(),
         });
-        
+
         io.emit("userOffline", { userId: socket.userId });
       } catch (error) {
         console.error("Error updating offline status:", error.message);
