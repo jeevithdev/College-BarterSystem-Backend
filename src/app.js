@@ -10,6 +10,7 @@ const { createRedisConnection } = require("./config/redis");
 const redisClient = createRedisConnection();
 
 const authRoutes = require("./routes/auth");
+const twoFactorRoutes = require("./routes/twoFactorRoutes");
 const itemRoutes = require("./routes/itemRoutes");
 const tradeRoutes = require("./routes/tradeRoutes");
 const conversationRoutes = require("./routes/conversationRoutes");
@@ -174,6 +175,7 @@ app.get("/api/files/config", (req, res) => {
 
 // ─── API Routes ───────────────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
+app.use("/api/auth/2fa", twoFactorRoutes);
 app.use("/api/items", itemRoutes);
 app.use("/api/trades", tradeRoutes);
 app.use("/api/conversations", conversationRoutes);

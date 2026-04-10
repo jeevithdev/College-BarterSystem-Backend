@@ -3,6 +3,7 @@ const router = express.Router();
 const { body, param } = require("express-validator");
 const authController = require("../controllers/authController");
 const authMiddleware = require("../middleware/authMiddleware");
+const { optional2FA, strict2FA } = require("../middleware/twoFactorMiddleware");
 
 // ─── Validation Rules ─────────────────────────────────────────────────
 const registerValidation = [
@@ -73,19 +74,33 @@ router.post("/register", registerValidation, authController.register);
 router.post("/login", loginValidation, authController.login);
 router.post("/refresh", refreshTokenValidation, authController.refreshToken);
 router.post("/logout", authMiddleware, logoutValidation, authController.logout);
-router.post("/logout-all", authMiddleware, authController.logoutAll);
 router.post("/forgot-password", forgotPasswordValidation, authController.forgotPassword);
 router.post("/reset-password", resetPasswordValidation, authController.resetPassword);
 
 // ─── Protected Routes ─────────────────────────────────────────────────
 router.get("/profile", authMiddleware, authController.getProfile);
 router.put("/profile", authMiddleware, updateProfileValidation, authController.updateProfile);
-router.put("/change-password", authMiddleware, changePasswordValidation, authController.changePassword);
-router.delete("/account", authMiddleware, authController.deleteAccount);
+router.put("/change-password", authMiddleware,
+  optional2FA({ operation: "password change" }),
+  changePasswordValidation,
+  authController.changePassword
+);
+router.delete("/account", authMiddleware,
+  strict2FA({ operation: "account deletion", minimumInterval: 60 }),
+  authController.deleteAccount
+);
 
 // ─── Session Management ──────────────────────────────────────────────
 router.get("/sessions", authMiddleware, authController.getActiveSessions);
-router.delete("/sessions/:sessionId", authMiddleware, sessionValidation, authController.revokeSession);
+router.post("/logout-all", authMiddleware,
+  optional2FA({ operation: "logout all devices" }),
+  authController.logoutAll
+);
+router.delete("/sessions/:sessionId", authMiddleware,
+  optional2FA({ operation: "session revocation" }),
+  sessionValidation,
+  authController.revokeSession
+);
 
 // ─── Public User Profile ──────────────────────────────────────────────
 router.get("/users/:id", authController.getPublicProfile);

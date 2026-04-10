@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const User = require("../models/User");
 const Message = require("../models/Message");
 const Conversation = require("../models/Conversation");
+const { hasActiveConnection } = require("../services/notificationService");
 
 const sendPushNotification = async (userId, title, body, data = {}) => {
   try {
@@ -81,8 +82,8 @@ const notifyNewMessage = async (conversationId, messageId, senderId) => {
       const preferences = participant.notificationPreferences;
       if (preferences && preferences.newMessage === false) continue;
 
-      const hasActiveSocket = global.io?.sockets?.adapter?.rooms?.get(`user:${participant._id}`);
-      if (hasActiveSocket) continue;
+      // Check if user has active socket connection using notification service
+      if (hasActiveConnection(participant._id.toString())) continue;
 
       await sendPushNotification(
         participant._id,
